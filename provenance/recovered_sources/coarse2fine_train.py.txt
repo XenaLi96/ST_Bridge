@@ -1,0 +1,332 @@
+#!/usr/bin/env python3
+
+import os
+import sys
+import time
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.optim import AdamW
+from torch_geometric.loader import NeighborSampler
+from sklearn.cluster import MiniBatchKMeans
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if ROOT not in sys.path:
+    sys.path.insert(0, ROOT)
+
+from utils import load_data
+from model import GraphAutoencoder, NormalEncoder
+import importlib.util
+
+def _load_module(module_path: str, module_name: str):
+    spec = importlib.util.spec_from_file_location(module_name, module_path)
+    mod = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(mod)
+    return mod
+
+MOD_DIR = os.path.join(ROOT, '2509coarse2fine')
+model_c2f = _load_module(os.path.join(MOD_DIR, 'model_c2f.py'), 'model_c2f_2509')
+
+MARKER_SETS = {
+    "kidney": {
+        "ProximalTubule": ["Slc34a1", "Lrp2", "Slc27a2", "Aldob", "Miox", "Acsm2", "Ass1", "Ggt1", "Fbp1", "Pdzk1"],
+        "LoopHenle": ["Umod", "Slc12a1", "Car2"],
+        "Podocyte": ["Gpx3", "Igfbp5", "Cryab"],
+        "VascularStromal": ["Ly6a", "Igfbp4", "Lpl", "Plau"],
+    }
+}
+
+
+def _build_marker_idx(genes, marker_mode):
+    marker_sets = MARKER_SETS.get(marker_mode, {})
+    gene_to_idx = {str(g): i for i, g in enumerate(genes)}
+    labels = []
+    idxs = []
+    for label, markers in marker_sets.items():
+        use = [gene_to_idx[g] for g in markers if g in gene_to_idx]
+        if use:
+            labels.append(label)
+            idxs.append(torch.tensor(use, dtype=torch.long))
+    return labels, idxs
+
+
+def _marker_scores(expr: torch.Tensor, marker_idx):
+    expr_log = torch.log1p(torch.clamp(expr, min=0.0))
+    scores = [expr_log.index_select(1, idx.to(expr.device)).mean(dim=1) for idx in marker_idx]
+    return torch.stack(scores, dim=1)
+
+
+def main():
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    hidden_dim = 64
+    rng = np.random.default_rng(0)
+
+    # Optional experiment toggles
+    use_sum = int(os.environ.get("C2F_USE_SUM", "0")) == 1
+    l1_lambda = float(os.environ.get("C2F_L1", "0.0"))
+    expr_head_on = int(os.environ.get("C2F_EXPR_HEAD", "0")) == 1
+    expr_lambda = float(os.environ.get("C2F_EXPR_LAMBDA", "0.2"))
+    expr_thresh = float(os.environ.get("C2F_EXPR_THRESH", "0.1"))
+    expr_gate = int(os.environ.get("C2F_EXPR_GATE", "0")) == 1
+    expr_gate_hard = int(os.environ.get("C2F_EXPR_HARD", "0")) == 1
+    expr_gate_thr = float(os.environ.get("C2F_EXPR_GATE_THRESH", "0.5"))
+    rate_lambda = float(os.environ.get("C2F_RATE_LAMBDA", "0.0"))
+    use_pos_head = int(os.environ.get("C2F_POS_HEAD", "0")) == 1
+    use_node_gnn = int(os.environ.get("C2F_NODE_GNN", "0")) == 1
+    lam_scale = float(os.environ.get("C2F_LAM_SCALE", "1.0"))
+    var_lambda = float(os.environ.get("C2F_VAR_LAMBDA", "0.0"))
+    q_lambda = float(os.environ.get("C2F_Q_LAMBDA", "0.0"))
+    q_list = os.environ.get("C2F_QS", "0.1,0.5,0.9").split(",")
+    qs = []
+    for q in q_list:
+        q = q.strip()
+        if not q:
+            continue
+        try:
+            qs.append(float(q))
+        except ValueError:
+            continue
+    use_celltype = int(os.environ.get("C2F_CELLTYPE", "0")) == 1
+    ct_k = int(os.environ.get("C2F_CT_K", "8"))
+    ct_lambda = float(os.environ.get("C2F_CT_LAMBDA", "0.2"))
+    ct_sample = int(os.environ.get("C2F_CT_SAMPLE", "200000"))
+    use_rank = int(os.environ.get("C2F_RANK", "0")) == 1
+    rank_lambda = float(os.environ.get("C2F_RANK_LAMBDA", "0.2"))
+    rank_pairs = int(os.environ.get("C2F_RANK_PAIRS", "256"))
+    rank_eps = float(os.environ.get("C2F_RANK_EPS", "1e-3"))
+    rank_tau = float(os.environ.get("C2F_RANK_TAU", "1.0"))
+    node_loss_w = float(os.environ.get("C2F_NODE_LOSS", "1.0"))
+    use_marker_sup = int(os.environ.get("C2F_MARKER_SUP", "0")) == 1
+    marker_mode = os.environ.get("C2F_MARKER_MODE", "kidney").strip().lower()
+    marker_lambda = float(os.environ.get("C2F_MARKER_LAMBDA", "0.5"))
+    marker_kl_lambda = float(os.environ.get("C2F_MARKER_KL_LAMBDA", "0.2"))
+    marker_ce_lambda = float(os.environ.get("C2F_MARKER_CE_LAMBDA", "0.2"))
+    marker_temp = float(os.environ.get("C2F_MARKER_TEMP", "1.0"))
+
+    data = load_data(subset_size=None, verbose=False, hidden_dim=hidden_dim)
+    input_dim = int(data.adata.n_vars)
+    marker_labels = []
+    marker_idx = []
+    if use_marker_sup:
+        marker_labels, marker_idx = _build_marker_idx(list(data.adata.var_names), marker_mode)
+        if len(marker_idx) < 2:
+            raise SystemExit(f"Marker supervision requested but too few marker sets overlap for mode={marker_mode}: {marker_labels}")
+        print(f"Marker supervision: mode={marker_mode}, labels={marker_labels}", flush=True)
+    model = GraphAutoencoder(input_dim=input_dim, hidden_dim=hidden_dim, gnn_type='gcn').to(device)
+    normal_encoder = NormalEncoder(input_dim=386, hidden_dim=hidden_dim).to(device)
+    refiner = model_c2f.ResidualRefiner(hidden_dim=hidden_dim, output_dim=input_dim).to(device)
+    pos_head = None
+    if use_pos_head:
+        pos_head = model_c2f.PosHead(hidden_dim=hidden_dim, output_dim=input_dim).to(device)
+    node_gnn = None
+    if use_node_gnn:
+        node_gnn = model_c2f.NodeGNN(hidden_dim=hidden_dim, dropout=0.1).to(device)
+    expr_head = None
+    if expr_head_on:
+        expr_head = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.1),
+            nn.Linear(hidden_dim, input_dim),
+        ).to(device)
+
+    params = list(model.parameters()) + list(normal_encoder.parameters()) + list(refiner.parameters())
+    if pos_head is not None:
+        params += list(pos_head.parameters())
+    if node_gnn is not None:
+        params += list(node_gnn.parameters())
+    if expr_head is not None:
+        params += list(expr_head.parameters())
+    optim = AdamW(params, lr=1e-3, weight_decay=1e-4)
+
+    sampler = NeighborSampler(edge_index=data.super_node_edge, sizes=[-1, -1], batch_size=1024, shuffle=True)
+
+    # optional cell-type prior (cluster on visual features)
+    kmeans = None
+    cluster_means = None
+    if use_celltype:
+        vit_list = []
+        real_list = []
+        for s, sub in data.subgraphs.items():
+            if data.test_super_nodes and s in data.test_super_nodes:
+                continue
+            for node in sub.nodes:
+                feat = np.asarray(sub.nodes[node]["features"].todense())
+                real_list.append(feat[:, :input_dim])
+                vit_list.append(feat[:, input_dim:])
+        if len(vit_list) == 0:
+            raise SystemExit("No training nodes found for cell-type prior.")
+        if ct_sample > 0 and len(vit_list) > ct_sample:
+            idx = rng.choice(len(vit_list), ct_sample, replace=False)
+            vit_mat = np.vstack([vit_list[i] for i in idx])
+            real_mat = np.vstack([real_list[i] for i in idx])
+        else:
+            vit_mat = np.vstack(vit_list)
+            real_mat = np.vstack(real_list)
+        vit_mat = vit_mat.astype(np.float32, copy=False)
+        real_mat = real_mat.astype(np.float32, copy=False)
+        kmeans = MiniBatchKMeans(n_clusters=ct_k, random_state=0, batch_size=4096)
+        labels = kmeans.fit_predict(vit_mat)
+        cluster_means = np.zeros((ct_k, input_dim), dtype=np.float32)
+        for k in range(ct_k):
+            mask = labels == k
+            if mask.any():
+                cluster_means[k] = real_mat[mask].mean(axis=0)
+        cluster_means = torch.tensor(cluster_means, device=device)
+        print(f"Cell-type prior: k={ct_k}, sample={vit_mat.shape[0]}", flush=True)
+
+    # anneal consistency weight: coarse mean/sum == super gene
+    max_epochs = 12
+    for epoch in range(max_epochs):
+        lam = float(np.interp(epoch, [0, max_epochs - 1], [1.0, 0.1])) * lam_scale
+        t0 = time.time(); tot = 0.0; cnt = 0
+        for _, n_id, _ in sampler:
+            for sid in n_id:
+                s = data.inverse_super_node_mapping[sid.item()]
+                if s not in data.subgraphs:
+                    continue
+                edge_index = data.get_normal_node_edge_index(s).to(device)
+                if edge_index.numel() == 0:
+                    continue
+                sub = data.subgraphs[s]
+
+                vit, real = [], []
+                for node in sub.nodes:
+                    feat = torch.tensor(sub.nodes[node]['features'].todense(), dtype=torch.float)
+                    real.append(feat[:, :input_dim])
+                    vit.append(feat[:, input_dim:])
+                if not real:
+                    continue
+                real = torch.stack(real).squeeze().to(device)  # [N,G]
+                vit = torch.stack(vit).squeeze().to(device)    # [N,386]
+
+                # super gene vector (coarse) from main graph features
+                g_s = torch.tensor(data.main_graph.nodes[s]['features'], dtype=torch.float, device=device)  # [G]
+                coarse = g_s.unsqueeze(0).expand(real.shape[0], -1)
+
+                optim.zero_grad()
+                # encode visual features to node hidden
+                node_hidden = normal_encoder(vit)
+                if node_gnn is not None:
+                    node_hidden = node_gnn(node_hidden, edge_index)
+                # residual refinement
+                if pos_head is not None:
+                    pos = pos_head(node_hidden)
+                    pred = F.softplus(coarse + pos)
+                else:
+                    pred = refiner(node_hidden, coarse)
+                expr_logits = None
+                if expr_head is not None:
+                    expr_logits = expr_head(node_hidden)
+                    if expr_gate:
+                        gate = torch.sigmoid(expr_logits)
+                        if expr_gate_hard:
+                            hard = (gate >= expr_gate_thr).float()
+                            gate = hard - gate.detach() + gate
+                        pred = pred * gate
+
+                # losses
+                loss_fit = F.smooth_l1_loss(pred, real)
+                loss = node_loss_w * loss_fit
+                if use_sum:
+                    sum_pred = pred.sum(dim=0)
+                    loss_cons = F.mse_loss(sum_pred, g_s * pred.shape[0])
+                else:
+                    mean_pred = pred.mean(dim=0)
+                    loss_cons = F.mse_loss(mean_pred, g_s)
+                loss = loss + lam * loss_cons
+                if l1_lambda > 0:
+                    loss = loss + l1_lambda * pred.abs().mean()
+                if expr_logits is not None:
+                    target_expr = (real > expr_thresh).float()
+                    bce = F.binary_cross_entropy_with_logits(expr_logits, target_expr)
+                    loss = loss + expr_lambda * bce
+                    if rate_lambda > 0:
+                        gt_rate = target_expr.mean(dim=0)
+                        pred_rate = torch.sigmoid(expr_logits).mean(dim=0)
+                        loss = loss + rate_lambda * F.mse_loss(pred_rate, gt_rate)
+                if var_lambda > 0:
+                    pred_std = pred.std(dim=0)
+                    real_std = real.std(dim=0)
+                    loss = loss + var_lambda * F.mse_loss(pred_std, real_std)
+                if q_lambda > 0 and qs:
+                    q_loss = 0.0
+                    for q in qs:
+                        pred_q = torch.quantile(pred, q, dim=0)
+                        real_q = torch.quantile(real, q, dim=0)
+                        q_loss = q_loss + F.mse_loss(pred_q, real_q)
+                    loss = loss + q_lambda * (q_loss / max(len(qs), 1))
+                if marker_idx:
+                    gt_scores = _marker_scores(real, marker_idx)
+                    pred_scores = _marker_scores(pred, marker_idx)
+                    if marker_lambda > 0:
+                        loss = loss + marker_lambda * F.mse_loss(pred_scores, gt_scores)
+                    if marker_kl_lambda > 0:
+                        gt_soft = torch.softmax(gt_scores / marker_temp, dim=1)
+                        pred_log_soft = torch.log_softmax(pred_scores / marker_temp, dim=1)
+                        loss = loss + marker_kl_lambda * F.kl_div(
+                            pred_log_soft,
+                            gt_soft,
+                            reduction='batchmean',
+                        ) * (marker_temp ** 2)
+                    if marker_ce_lambda > 0:
+                        gt_ct = gt_scores.argmax(dim=1)
+                        loss = loss + marker_ce_lambda * F.cross_entropy(pred_scores, gt_ct)
+                if kmeans is not None and cluster_means is not None:
+                    labels = kmeans.predict(vit.detach().cpu().numpy().astype(np.float32))
+                    ct_target = cluster_means[torch.tensor(labels, device=device)]
+                    loss = loss + ct_lambda * F.mse_loss(pred, ct_target)
+                if use_rank and pred.shape[0] >= 2:
+                    # pairwise ranking loss within supernode (per gene)
+                    n_nodes = pred.shape[0]
+                    k_pairs = min(rank_pairs, n_nodes * (n_nodes - 1) // 2)
+                    if k_pairs > 0:
+                        idx_i = torch.randint(0, n_nodes, (k_pairs,), device=device)
+                        idx_j = torch.randint(0, n_nodes, (k_pairs,), device=device)
+                        valid = idx_i != idx_j
+                        if valid.any():
+                            idx_i = idx_i[valid]
+                            idx_j = idx_j[valid]
+                            delta_gt = real[idx_i] - real[idx_j]
+                            delta_pred = pred[idx_i] - pred[idx_j]
+                            mask = delta_gt.abs() > rank_eps
+                            if mask.any():
+                                sign = torch.sign(delta_gt)
+                                score = -sign * delta_pred / rank_tau
+                                loss_rank = F.softplus(score)[mask].mean()
+                                loss = loss + rank_lambda * loss_rank
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(params, 1.0)
+                optim.step()
+
+                tot += loss.item(); cnt += 1
+        print(f"Epoch {epoch}: loss={tot/max(cnt,1):.4f} (lam={lam:.2f}) time={time.time()-t0:.1f}s", flush=True)
+
+    out_path = os.environ.get('C2F_CKPT_OUT', '2509coarse2fine/checkpoints/c2f_latest.pth')
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    ckpt = {
+        'model_state_dict': model.state_dict(),
+        'normal_encoder_state_dict': normal_encoder.state_dict(),
+        'refiner_state_dict': refiner.state_dict(),
+    }
+    if expr_head is not None:
+        ckpt['expr_head_state_dict'] = expr_head.state_dict()
+        ckpt['expr_gate'] = expr_gate
+        ckpt['expr_gate_hard'] = expr_gate_hard
+        ckpt['expr_gate_thr'] = expr_gate_thr
+    if pos_head is not None:
+        ckpt['pos_head_state_dict'] = pos_head.state_dict()
+        ckpt['use_pos_head'] = True
+    if node_gnn is not None:
+        ckpt['node_gnn_state_dict'] = node_gnn.state_dict()
+        ckpt['use_node_gnn'] = True
+    if kmeans is not None:
+        ckpt['ct_k'] = ct_k
+    torch.save(ckpt, out_path)
+    print(f'Saved {out_path}', flush=True)
+
+
+if __name__ == '__main__':
+    main()

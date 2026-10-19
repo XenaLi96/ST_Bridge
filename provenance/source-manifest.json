@@ -1,0 +1,41 @@
+{
+  "snapshot_date": "2026-10-17",
+  "sources": [
+    {
+      "source": "HGNN4ST/model.py",
+      "sha256": "f4fe6e853498a443fbfbe8b8c046aa54b6f52d5adaf4d9eee79b4ca4ac99ce8a"
+    },
+    {
+      "source": "HGNN4ST/dataset.py",
+      "sha256": "ee23d0b80c117ed905cd80864013d63d4f427bf1e9befa1e4010ea77d1dd781f"
+    },
+    {
+      "source": "HGNN4ST/utils.py",
+      "sha256": "c585236763662ef4313d73f5e5db2844f4c91c3dbe884d3584b7bb926330ff8f"
+    },
+    {
+      "source": "HGNN4ST/train.py",
+      "sha256": "86914d9907260b82c6fda0b942859862b300e29ebbe6c239ff1aa422e5272042"
+    },
+    {
+      "source": "HGNN4ST/2509coarse2fine/model_c2f.py",
+      "sha256": "e8d93ac157fc00e808dfae84e1547ae8bb6c0533db87254cda7ad7b882826ba8"
+    },
+    {
+      "source": "HGNN4ST/2509coarse2fine/train_coarse2fine.py",
+      "sha256": "968967e0641739fa31c40a070aeeefb1776a8291d95efe348bce32618e422a77"
+    },
+    {
+      "source": "HGNN4ST/submit_c2f_train_h_celltype_quantile.sh",
+      "sha256": "9afac2fa42a5c6d1b5257c641401cba63f77b053dd87dbca11228915255366fa"
+    },
+    {
+      "source": "HGNN4ST/submit_c2f_train_ak_ad_shared16_celltype_quantile.sh",
+      "sha256": "f343ed82390ea3a6c60fd52460641adb8bef01eafb5e96974274b102a7df7d1a"
+    }
+  ],
+  "exact_model_copies": {
+    "src/bridge_st/models.py": "HGNN4ST/model.py",
+    "src/bridge_st/refinement.py": "HGNN4ST/2509coarse2fine/model_c2f.py"
+  }
+}

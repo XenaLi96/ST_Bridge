@@ -1,0 +1,21 @@
+cff-version: 1.2.0
+message: "Please cite the BRIDGE manuscript when using this research software. Publication identifiers will be added after author confirmation."
+type: software
+title: "BRIDGE: Spatially aware bimodal representation integration with hierarchical graphs for spatial transcriptomics resolution enhancement"
+version: 0.1.0rc1
+date-released: 2026-10-17
+authors:
+  - family-names: Li
+    given-names: Xi
+  - family-names: Duan
+    given-names: Ziheng
+  - family-names: Sikdar
+    given-names: Diptanshu
+  - family-names: Wang
+    given-names: Dejiang
+  - family-names: Di
+    given-names: Xiangjun
+  - family-names: Liu
+    given-names: Yang
+  - family-names: Zhang
+    given-names: Jing

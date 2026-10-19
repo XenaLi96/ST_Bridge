@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "bridge-spatial"
+version = "0.1.0rc1"
+description = "BRIDGE spatial transcriptomics research models and portable training/prediction tools"
+readme = "README.md"
+requires-python = ">=3.9,<3.12"
+authors = [{name = "BRIDGE contributors"}]
+dependencies = [
+    "numpy==1.26.4",
+    "torch==2.4.1",
+    "torch-geometric==2.5.3",
+    "scipy==1.13.1",
+    "scikit-learn==1.5.2"
+]
+
+[project.optional-dependencies]
+hd = ["pandas==2.0.3", "scanpy==1.10.2", "anndata==0.10.9", "h5py==3.11.0", "pyarrow==17.0.0"]
+
+[project.scripts]
+bridge-st = "bridge_st.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+

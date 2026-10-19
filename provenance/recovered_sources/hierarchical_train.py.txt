@@ -1,0 +1,387 @@
+import os
+from tqdm import tqdm
+import time
+import argparse
+import logging
+from datetime import datetime
+
+import torch
+import torch.nn.functional as F
+from torch.optim.lr_scheduler import StepLR
+from torch_geometric.loader import NeighborSampler
+from utils import load_data, evaluate
+from model import GraphAutoencoder, NoisePredictor, custom_readout, NormalEncoder
+from torch.utils.tensorboard import SummaryWriter
+
+
+def setup_logging(args):
+    """Set up logging to output to both console and file and tensorboard"""
+    # Create output directory if it doesn't exist
+    log_dir = os.path.join("output", args.name)
+    
+    # If not resuming and the directory already exists, add timestamp
+    if not args.resume and os.path.exists(log_dir):
+        timestamp = datetime.now().strftime("%m%d_%H%M%S")
+        log_dir = os.path.join("output", f"{args.name}_{timestamp}")
+    
+    os.makedirs(log_dir, exist_ok=True)
+    
+    # Create a timestamp for the log file
+    timestamp = datetime.now().strftime("%m%d_%H%M%S")
+    log_file = os.path.join(log_dir, f"training_{timestamp}.log")
+    
+    # Configure the logger
+    logger = logging.getLogger()
+    logger.setLevel(logging.INFO)
+    
+    # Remove any existing handlers
+    if logger.hasHandlers():
+        logger.handlers.clear()
+    
+    # Create console handler and set level
+    console_handler = logging.StreamHandler()
+    console_handler.setLevel(logging.INFO)
+    
+    # Create file handler and set level
+    file_handler = logging.FileHandler(log_file)
+    file_handler.setLevel(logging.INFO)
+    
+    # Create formatter
+    formatter = logging.Formatter('%(asctime)s - %(message)s')
+    console_handler.setFormatter(formatter)
+    file_handler.setFormatter(formatter)
+    
+    # Add handlers to logger
+    logger.addHandler(console_handler)
+    logger.addHandler(file_handler)
+    
+    logging.info(f"Logging initialized. Saving logs to {log_file}")
+    logging.info(f"Arguments: {args}")
+    
+    # Create TensorBoard writer
+    tb_log_dir = os.path.join(log_dir, "tensorboard")
+    writer = SummaryWriter(log_dir=tb_log_dir)
+    logging.info(f"TensorBoard logs will be saved to {tb_log_dir}")
+    
+    return logger, writer
+
+
+def parse_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--subset_size", type=int, default=None, help="Size of data subset"
+    )
+    parser.add_argument("--verbose", action="store_true", help="Verbose output")
+    parser.add_argument(
+        "--batch_size",
+        type=int,
+        default=2048,
+        help="Batch size for training",
+    )
+    parser.add_argument("--input_dim", type=int, default=3000, help="Input dimension")
+    parser.add_argument("--hidden_dim", type=int, default=64, help="Hidden dimension")
+    parser.add_argument(
+        "--gnn_type", type=str, default="gcn", help="Type of GNN to use"
+    )
+    parser.add_argument(
+        "--num_layers", type=int, default=2, help="Number of GNN layers"
+    )
+
+    parser.add_argument("--name", default="", type=str, help="Name of the experiment")
+    parser.add_argument("--lr", type=float, default=0.01, help="Learning rate")
+    parser.add_argument(
+        "--resume", default=None, type=str, help="Path to checkpoint to resume from"
+    )
+    args = parser.parse_args()
+    return args
+
+
+def save_checkpoint(
+    epoch, model, noise_predictor, normal_encoder, optimizer, scheduler, loss, checkpoint_dir, global_step
+):
+    checkpoint = {
+        "epoch": epoch,
+        "model_state_dict": model.state_dict(),
+        "noise_predictor_state_dict": noise_predictor.state_dict(),
+        "normal_encoder_state_dict": normal_encoder.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
+        "scheduler_state_dict": scheduler.state_dict() if scheduler else None,
+        "loss": loss,
+        "global_step": global_step
+    }
+    os.makedirs(checkpoint_dir, exist_ok=True)
+    checkpoint_path = os.path.join(checkpoint_dir, f"epoch_{epoch}.pth")
+    torch.save(checkpoint, checkpoint_path)
+    logging.info(f"Checkpoint saved at {checkpoint_path}")
+
+
+def load_checkpoint(checkpoint_path, model, noise_predictor, normal_encoder, optimizer, scheduler=None):
+    checkpoint = torch.load(checkpoint_path)
+    model.load_state_dict(checkpoint["model_state_dict"])
+    noise_predictor.load_state_dict(checkpoint["noise_predictor_state_dict"])
+    normal_encoder.load_state_dict(checkpoint["normal_encoder_state_dict"])
+    optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+    if scheduler is not None and "scheduler_state_dict" in checkpoint and checkpoint["scheduler_state_dict"]:
+        scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
+    epoch = checkpoint["epoch"]
+    loss = checkpoint["loss"]
+    global_step = checkpoint.get("global_step", epoch * 0)  # Default to epoch * 0 if not found
+    logging.info(f"Loaded checkpoint from {checkpoint_path} (epoch {epoch}, global_step {global_step})")
+    return epoch, loss, global_step
+
+
+# Main training function for single GPU
+def train():
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    args = parse_args()
+    # Set up logging before anything else
+    _, writer = setup_logging(args)
+    
+    logging.info(f"Using device: {device}")
+    sizes = [-1] * args.num_layers
+
+    data = load_data(
+        subset_size=args.subset_size, verbose=args.verbose, hidden_dim=args.hidden_dim
+    )
+
+    sampler = NeighborSampler(
+        edge_index=data.super_node_edge,
+        sizes=sizes,
+        batch_size=args.batch_size,
+        shuffle=True,
+        num_workers=0,  # Increase number of workers
+        # persistent_workers=True,
+        # pin_memory=True,
+    )
+    model = GraphAutoencoder(
+        input_dim=args.input_dim, hidden_dim=args.hidden_dim, gnn_type=args.gnn_type
+    ).to(device)
+    noise_predictor = NoisePredictor(
+        hidden_dim=args.hidden_dim, output_dim=args.input_dim
+    ).to(device)
+    normal_encoder = NormalEncoder(
+        input_dim=386, hidden_dim=args.hidden_dim
+    ).to(device)
+    optimizer = torch.optim.Adam(
+        list(model.parameters())
+        + list(noise_predictor.parameters())
+        + list(normal_encoder.parameters()),
+        lr=args.lr,
+        weight_decay=0.0001,
+    )
+    
+    epochs = 20000
+    scheduler = StepLR(optimizer, step_size=10000, gamma=0.5)
+    criterion = torch.nn.MSELoss()
+
+    start_epoch = 0
+    global_step = 0
+
+    if args.resume and os.path.exists(args.resume):
+        start_epoch, _, loaded_global_step = load_checkpoint(
+            args.resume, model, noise_predictor, normal_encoder, optimizer, scheduler
+        )
+        global_step = loaded_global_step if loaded_global_step else start_epoch * len(sampler)
+        for param_group in optimizer.param_groups:
+            param_group['lr'] = args.lr
+        logging.info(f"Updated learning rate to {args.lr}")
+        logging.info(f"Resuming training from epoch {start_epoch + 1}, global_step {global_step}")
+    else:
+        logging.info("Starting training from scratch")
+
+    for epoch in range(start_epoch, epochs):
+        model.train()
+        noise_predictor.train()
+        total_loss = 0
+        epoch_start_time = time.time()
+
+        # Initialize timing accumulators
+        data_time = 0
+        # forward_time = 0
+        # backward_time = 0
+        num_batches = 0
+
+        for batch_size, n_id, adjs in sampler:
+            num_batches += 1
+            optimizer.zero_grad()
+            batch_start_time = time.time()
+
+            x = data.super_node_features[n_id].to(device)
+            adjs = [adj.to(device) for adj in adjs]
+            edge_indices = [adj.edge_index for adj in adjs]
+            data_end_time = time.time()
+            data_time += data_end_time - batch_start_time
+
+            # Forward pass through autoencoder
+            z, decoded_logits = model(x, edge_indices)
+            # Autoencoder reconstruction loss
+            recon_loss = criterion(decoded_logits, x)
+            loss = recon_loss
+
+            # * Compute loss for normal node hidden representations
+            for i, super_node_id in enumerate(n_id):
+                # * load train super node, eg. "00100_00026"
+                super_node = data.inverse_super_node_mapping[super_node_id.item()]
+                if (super_node not in data.subgraphs.keys()):
+                    continue
+                normal_edge_index = data.get_normal_node_edge_index(super_node).to(device)
+                if normal_edge_index.numel() == 0:
+                    continue
+
+                super_node_hidden = z[i]
+                subgraph = data.subgraphs[super_node]
+
+                # * load gene expressions and vit feature of normal nodes
+                vit_feature = []
+                real_node_gene_expression = []
+                for node in subgraph.nodes:
+                    features = torch.tensor(
+                        subgraph.nodes[node]["features"].todense(), dtype=torch.float
+                    )
+                    real_node_gene_expression.append(features[:, :50])
+                    vit_feature.append(features[:, 50:])
+                real_node_gene_expression = (
+                    torch.stack(real_node_gene_expression).squeeze().to(device)
+                )
+                vit_feature = torch.stack(vit_feature).squeeze().to(device)
+
+                # Use softplus to avoid exp overflow/negative log1p inputs
+                predicted_noise = F.softplus(noise_predictor(super_node_hidden))
+
+                normal_node_hidden = normal_encoder(vit_feature)
+                normal_node_hidden = torch.clamp(normal_node_hidden, -20.0, 20.0)
+                # * Decode normal node hidden representations to node gene expression
+                node_gene_expression = F.relu(
+                    model.decoder_layer2(
+                        model.decoder_layer1(normal_node_hidden, normal_edge_index),
+                        normal_edge_index,
+                    )
+                )
+                node_gene_expression = torch.clamp(node_gene_expression, 0.0, 20.0)
+                node_gene_expression = torch.nan_to_num(node_gene_expression, nan=0.0, posinf=20.0, neginf=0.0)
+                pred_node_gene_expression = F.softplus(node_gene_expression)
+                pred_node_gene_expression = torch.nan_to_num(pred_node_gene_expression, nan=0.0, posinf=50.0, neginf=0.0)
+
+                # * combine pred node gene expressions and add the predicted noise
+                combined_gene_expression = (
+                    pred_node_gene_expression.sum(dim=0) + predicted_noise
+                )
+                combined_gene_expression_log1p = torch.log1p(torch.clamp(combined_gene_expression, min=0.0) + 1e-8)
+                combined_gene_expression_log1p = torch.nan_to_num(combined_gene_expression_log1p, nan=0.0, posinf=50.0, neginf=0.0)
+
+                # * MSE loss for super node gene expression prediction
+                super_node_gene_expression = x[i]
+
+                # non_zero_mask = (super_node_gene_expression > 0.0)
+                # combined_gene_expression_log1p = combined_gene_expression_log1p[non_zero_mask]
+                # super_node_gene_expression = super_node_gene_expression[non_zero_mask]
+                # Detailed NaN/Inf checks inside normal-node loss components
+                if not torch.isfinite(predicted_noise).all():
+                    logging.error(f"predicted_noise NaN/Inf at super_node={super_node}")
+                    continue
+                if not torch.isfinite(pred_node_gene_expression).all():
+                    logging.error(f"pred_node_gene_expression NaN/Inf at super_node={super_node}")
+                    continue
+                if not torch.isfinite(combined_gene_expression_log1p).all():
+                    logging.error(f"combined_gene_expression_log1p NaN/Inf at super_node={super_node}")
+                    continue
+                if not torch.isfinite(real_node_gene_expression).all():
+                    logging.error(f"real_node_gene_expression NaN/Inf at super_node={super_node}")
+                    continue
+
+                gene_expression_loss = criterion(super_node_gene_expression, combined_gene_expression_log1p)
+
+                readout_loss = criterion(custom_readout(normal_node_hidden), super_node_hidden)
+                combined_loss = readout_loss + gene_expression_loss
+
+                # Skip if any component is non-finite
+                if not torch.isfinite(gene_expression_loss).item() or not torch.isfinite(readout_loss).item():
+                    logging.error(f"non-finite component loss at super_node={super_node}")
+                    continue
+                loss += combined_loss
+
+                # * MSE loss for normal node feature prediction during training
+                if super_node not in data.test_super_nodes:
+                    # normal_non_zero_mask = (real_node_gene_expression > 0.0)
+                    # node_gene_expression = node_gene_expression[normal_non_zero_mask]
+                    # real_node_gene_expression = real_node_gene_expression[normal_non_zero_mask]
+                    real_node_gene_expression = torch.nan_to_num(real_node_gene_expression, nan=0.0, posinf=20.0, neginf=0.0)
+                    normal_loss = criterion(node_gene_expression, real_node_gene_expression)
+                    if not torch.isfinite(normal_loss).item():
+                        logging.error(f"non-finite normal_loss at super_node={super_node}")
+                        continue
+                    loss += normal_loss
+
+            # forward_end_time = time.time()
+            # forward_time += forward_end_time - data_end_time
+
+            # If loss is NaN/Inf, dump diagnostics and stop early
+            if not torch.isfinite(loss).item():
+                logging.error("NaN/Inf loss detected. Dumping tensor stats for debugging.")
+                logging.error(f"x: nan={torch.isnan(x).any().item()} inf={torch.isinf(x).any().item()} min={float(torch.min(x))} max={float(torch.max(x))}")
+                logging.error(f"decoded_logits: nan={torch.isnan(decoded_logits).any().item()} inf={torch.isinf(decoded_logits).any().item()} min={float(torch.min(decoded_logits))} max={float(torch.max(decoded_logits))}")
+                logging.error(f"z: nan={torch.isnan(z).any().item()} inf={torch.isinf(z).any().item()} min={float(torch.min(z))} max={float(torch.max(z))}")
+                logging.error(f"recon_loss: {recon_loss.item()}")
+                logging.error(f"loss value: {loss.item()}")
+                raise RuntimeError("NaN/Inf loss detected; see logs for tensor stats.")
+
+            total_loss += loss.item()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(
+                list(model.parameters()) + list(noise_predictor.parameters()) + list(normal_encoder.parameters()),
+                max_norm=1.0,
+            )
+            optimizer.step()
+            global_step += 1
+            
+            # Log batch loss periodically
+            if global_step % 100 == 0:
+                writer.add_scalar('Training/BatchLoss', loss.item(), global_step)
+
+        epoch_end_time = time.time()
+        epoch_duration = epoch_end_time - epoch_start_time
+
+        avg_loss = total_loss / len(sampler)
+        # Update learning rate scheduler
+        # scheduler.step()
+        
+        current_lr = optimizer.param_groups[0]['lr']
+        
+        # Log metrics to TensorBoard
+        writer.add_scalar('Training/EpochLoss', avg_loss, epoch)
+        writer.add_scalar('Training/LearningRate', current_lr, epoch)
+        writer.add_scalar('Training/EpochTime', epoch_duration, epoch)
+        
+        logging.info(
+            f"Epoch {epoch + 1}, Training Loss: {avg_loss:.4f} | "
+            f"Learning Rate: {current_lr} | "
+            f"Epoch Time: {epoch_duration:.2f}s | "
+        )
+
+        if (epoch + 1) % 50 == 0:
+            checkpoint_dir = os.path.join("checkpoints", args.name)
+            save_checkpoint(
+                epoch + 1,
+                model,
+                noise_predictor,
+                normal_encoder,
+                optimizer,
+                scheduler,
+                avg_loss,
+                checkpoint_dir,
+                global_step,
+            )
+
+        if (epoch + 1) % 10 == 0:
+            test_loss, test_corr, _, _ = evaluate(args, model, normal_encoder, data, device)
+            writer.add_scalar('Test/Loss', test_loss, epoch)
+            writer.add_scalar('Test/Corr', test_corr, epoch)
+            logging.info(f"Epoch {epoch + 1}, Test Loss: {test_loss:.4f}")
+
+    # Close the TensorBoard writer when done
+    writer.close()
+
+
+if __name__ == "__main__":
+    train()

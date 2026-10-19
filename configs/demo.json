@@ -1,0 +1,16 @@
+{
+  "mode": "c2f",
+  "hidden_dim": 16,
+  "epochs": 2,
+  "learning_rate": 0.001,
+  "batch_size": 4,
+  "seed": 0,
+  "expr_head": true,
+  "expr_gate": true,
+  "expr_gate_hard": true,
+  "expr_lambda": 2.0,
+  "rate_lambda": 5.0,
+  "quantile_lambda": 1.0,
+  "celltype": true,
+  "celltype_k": 3
+}

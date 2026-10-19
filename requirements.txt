@@ -1,0 +1,6 @@
+# Exact core versions validated in the research gcn environment.
+numpy==1.26.4
+torch==2.4.1
+torch-geometric==2.5.3
+scipy==1.13.1
+scikit-learn==1.5.2
